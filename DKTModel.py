@@ -5,13 +5,13 @@ import tensorflow as tf
 #work in progress
 class DKTModel(BaseModel):
     def __init__(self):
-        self.DROPOUT = 0.3
-        self.MAX_EPOCHS = 16
-        self.BATCH_SIZE = 8
-        self.MAX_LENGTH = 8768
-        self.LR = 0.0005
+        self.DROPOUT = 0.5
+        self.MAX_EPOCHS = 15
+        self.BATCH_SIZE = 32
+        self.MAX_LENGTH = 350
+        self.LR = 0.001
         self.HIDDEN_SIZE = 200
-        self.NUM_QUESTIONS = 6708
+        self.NUM_QUESTIONS = 8543
         self.EMBEDDING_SIZE = 25
         self.setup()
            
@@ -60,8 +60,9 @@ class DKTModel(BaseModel):
         masked_corrects = tf.boolean_mask(corrects, self.mask_placeholder)
         num_correct = tf.reduce_sum(masked_corrects)
         #num_correct = tf.reduce_sum(corrects)
-        num_total = tf.reduce_sum(tf.to_int32(self.mask_placeholder))
-        return num_correct, num_total
+        num_total = tf.reduce_sum(tf.to_int32(self.mask_placeholder))        
+        auc_score, auc_op = tf.metrics.auc(self.answers_placeholder, self.question_probs)
+        return num_correct, num_total, auc_score, auc_op
                
     def find_loss(self, probs, labels):
         losses = probs - tf.to_float(labels)
@@ -73,9 +74,11 @@ class DKTModel(BaseModel):
     def setup(self):
         self.addplaceholders()
         self.question_probs = self.data_pipeline()
-        self.num_correct, self.num_total = self.eval_probs()
+        self.num_correct, self.num_total, self.auc_score, self.auc_op = self.eval_probs()
         self.loss = self.find_loss(self.question_probs, self.answers_placeholder)
-        self.train_op = tf.train.AdamOptimizer(self.lr_placeholder).minimize(self.loss)
+        self.train_op = tf.train.AdamOptimizer(self.lr_placeholder).minimize(self.loss) #compute gradients
+        #gradient clip by global norm ...10
+        #apply gradients
         self.saver = tf.train.Saver()
         
     def train_on_batch(self, session, lengths, masks, answers, questions):
@@ -91,8 +94,8 @@ class DKTModel(BaseModel):
                      self.mask_placeholder: masks,
                      self.answers_placeholder: answers,
                      self.questions_placeholder: questions}
-        num_correct, num_total = session.run([self.num_correct, self.num_total], feed_dict = feed_dict)
-        return num_correct, num_total
+        num_correct, num_total, auc, v_hats = session.run([self.num_correct, self.num_total, self.auc_op, self.v_hats], feed_dict = feed_dict)
+        return num_correct, num_total, auc, v_hats
     
     # takes in the lists of answer sequences and corresponding question sequences, pads t
     def processdata(self, answers, questions, num_questions):
@@ -105,9 +108,14 @@ class DKTModel(BaseModel):
         for i in range(n):
             assert(len(answers[i]) == len(questions[i]))
             lencur = len(answers[i])
+            if lencur > self.MAX_LENGTH:
+                questions[i] = questions[i][:self.MAX_LENGTH]
+                answers[i] = answers[i][:self.MAX_LENGTH]
+                lencur = self.MAX_LENGTH
             lengths.append(lencur)
             #pads remaining question spots with 0s, but the mask indicates the padded spots
             padding = [0] * (self.MAX_LENGTH - lencur)
+            #paddingquestions = [[0] * 10] * (self.MAX_LENGTH - lencur)
             answers_padded.append(answers[i] + padding)
             questions_padded.append(questions[i] + padding)
             masks.append([1] * lencur + padding)            
@@ -128,32 +136,32 @@ class DKTModel(BaseModel):
                 batches.append(batch)
         return batches
     
-    def train(self, train_data): 
+    def train(self, train_data, eval_data): 
         with tf.Session() as session:
             session.run(tf.global_variables_initializer())
             session.run(tf.local_variables_initializer())
-            self.train_model(session, train_data)
+            self.train_model(self, session, train_data, eval_data)
         
-    def train_model(self, session, train_data):
+    def train_model(self, model, session, train_data, eval_data):
         processed = self.processdata(train_data['responses'], train_data['question_ids_modified'], self.NUM_QUESTIONS)
         lens, masks, answers, questions = processed
         assert(len(lens) == len(masks) == len(answers) == len(questions))
         zipped_data = list(zip(*processed))
         for epoch in range(self.MAX_EPOCHS):
-            print(epoch)
             np.random.shuffle(zipped_data)
             train_batches = self.batchify(zipped_data)
             for train_batch in train_batches:
-                loss = self.train_on_batch(session, *train_batch) 
+                loss = model.train_on_batch(session, *train_batch) 
                 print(loss)
+            self.eval_model(model, session, eval_data)
 
     def eval(self, eval_data):
          with tf.Session() as session:
             session.run(tf.global_variables_initializer())
             session.run(tf.local_variables_initializer())
-            self.eval_model(session, eval_data)
+            #self.eval_model(session, eval_data)
     
-    def eval_model(self, session, eval_data):
+    def eval_model(self, model, session, eval_data):
         processed = self.processdata(eval_data['responses'], eval_data['question_ids_modified'], self.NUM_QUESTIONS)
         lens, masks, answers, questions = processed
         assert(len(lens) == len(masks) == len(answers) == len(questions))
@@ -162,12 +170,15 @@ class DKTModel(BaseModel):
         test_batches = self.batchify(zipped_data)
         correct = 0.
         attempted = 0.
+        total_auc = 0.
         for test_batch in test_batches:
-            num_correct, num_total = self.test_on_batch(session, *test_batch)
+            num_correct, num_total, auc, v_hats = model.test_on_batch(session, *test_batch)
+            total_auc += num_total * auc
             correct += num_correct
             attempted += num_total
             print(correct)
-            print(attempted)
+            print(attempted)       
+        print("{} test examples right out of {}, which is {} percent. Mean AUC {}\n".format(
+            correct, attempted, 100.0*correct/attempted, 1.0*total_auc/attempted))
         return correct/attempted
-            
             
